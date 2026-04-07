@@ -1,3 +1,7 @@
+![CI](https://img.shields.io/badge/CI-GitHub_Actions-blue)
+![Language](https://img.shields.io/badge/Language-C-green)
+![Domain](https://img.shields.io/badge/Domain-Embedded-orange)
+![Standard](https://img.shields.io/badge/Standard-MISRA_C-red)
 # Embedded Firmware SDLC CI/CD Pipeline
 
 **End-to-end CI/CD automation for embedded firmware development**
