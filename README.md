@@ -16,8 +16,8 @@ I build reliable embedded systems, firmware, and automation tools for real-world
 ## Technologies
 
 C | C++ | Embedded C | Python | Bash  
-STM32 | TI C2000 | Raspberry Pi  
-UART | SPI | I2C | TCP/IP  
+STM32 | TI C2000 | Ardunio
+UART | SPI | I2C | TCP/IP  | Compter Architecture
 Linux | Git | Jenkins | Docker
 
 ## Featured Projects
