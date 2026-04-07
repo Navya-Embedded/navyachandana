@@ -1,0 +1,881 @@
+# ============================================================
+#  EMBEDDED SYSTEMS SDLC CI/CD PIPELINE
+#  DevOps Engineering | Full Lifecycle Automation
+#  Stages: Build → Static Analysis → Testing → Reports → Viz
+# ============================================================
+
+name: Embedded Systems SDLC Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - "release/**"
+      - "hotfix/**"
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+    inputs:
+      run_endurance:
+        description: "Run Endurance Testing (long-running)"
+        required: false
+        default: "false"
+        type: boolean
+      target_board:
+        description: "Target Hardware Board"
+        required: true
+        default: "stm32f4"
+        type: choice
+        options:
+          - stm32f4
+          - nxp_imx8
+          - renesas_rh850
+          - ti_tms570
+
+# ─────────────────────────────────────────────
+# Global Environment Variables
+# ─────────────────────────────────────────────
+env:
+  PROJECT_NAME: embedded-fw
+  BUILD_DIR: build
+  REPORTS_DIR: reports
+  ARTIFACTS_DIR: artifacts
+  KLOCWORK_URL: ${{ secrets.KLOCWORK_SERVER_URL }}
+  KLOCWORK_TOKEN: ${{ secrets.KLOCWORK_API_TOKEN }}
+  KLOCWORK_PROJECT: ${{ secrets.KLOCWORK_PROJECT_NAME }}
+  COVERAGE_THRESHOLD: 80
+  MISRA_RULESET: "misra_c_2012"
+  COMPILER_TOOLCHAIN: "arm-none-eabi-gcc"
+  CMAKE_BUILD_TYPE: "Release"
+  SONARQUBE_URL: ${{ secrets.SONARQUBE_URL }}
+  SONARQUBE_TOKEN: ${{ secrets.SONARQUBE_TOKEN }}
+
+# ─────────────────────────────────────────────
+# Concurrency — cancel stale runs on same branch
+# ─────────────────────────────────────────────
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ============================================================
+# JOBS
+# ============================================================
+jobs:
+
+  # ──────────────────────────────────────────
+  # JOB 1 ▸ SOURCE CHECKOUT & DEPENDENCY SETUP
+  # ──────────────────────────────────────────
+  setup:
+    name: "🔧 Setup & Dependency Resolution"
+    runs-on: [self-hosted, embedded-build-agent]
+    outputs:
+      build_version: ${{ steps.version.outputs.version }}
+      commit_sha:    ${{ steps.version.outputs.sha }}
+      branch_name:   ${{ steps.version.outputs.branch }}
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Extract Version & Metadata
+        id: version
+        run: |
+          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "0.0.0-dev")
+          SHA=$(git rev-parse --short HEAD)
+          BRANCH=${GITHUB_REF#refs/heads/}
+          echo "version=$VERSION"   >> $GITHUB_OUTPUT
+          echo "sha=$SHA"           >> $GITHUB_OUTPUT
+          echo "branch=$BRANCH"     >> $GITHUB_OUTPUT
+          echo "### 🏷 Build: $VERSION @ $SHA" >> $GITHUB_STEP_SUMMARY
+
+      - name: Cache ARM Toolchain
+        uses: actions/cache@v4
+        with:
+          path: /opt/arm-toolchain
+          key: arm-toolchain-${{ runner.os }}-gcc-12.3
+
+      - name: Install ARM GCC Toolchain
+        run: |
+          if [ ! -f /opt/arm-toolchain/bin/arm-none-eabi-gcc ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y gcc-arm-none-eabi binutils-arm-none-eabi \
+              libnewlib-arm-none-eabi cmake ninja-build lcov gcovr python3-pip
+          fi
+          arm-none-eabi-gcc --version
+
+      - name: Install Python Analysis Tools
+        run: |
+          pip3 install --quiet \
+            cppcheck-junit \
+            junit-xml \
+            jinja2 \
+            matplotlib \
+            pandas \
+            plotly \
+            kaleido \
+            pygments
+
+      - name: Cache CMake Build Directory
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BUILD_DIR }}
+          key: cmake-${{ runner.os }}-${{ hashFiles('**/CMakeLists.txt') }}-${{ steps.version.outputs.sha }}
+          restore-keys: |
+            cmake-${{ runner.os }}-${{ hashFiles('**/CMakeLists.txt') }}-
+
+  # ──────────────────────────────────────────
+  # JOB 2 ▸ FIRMWARE BUILD
+  # ──────────────────────────────────────────
+  build:
+    name: "🔨 Firmware Build"
+    runs-on: [self-hosted, embedded-build-agent]
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [stm32f4, nxp_imx8, renesas_rh850, ti_tms570]
+        build_type: [Debug, Release]
+        exclude:
+          - target: renesas_rh850
+            build_type: Debug
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure CMake — ${{ matrix.target }} [${{ matrix.build_type }}]
+        run: |
+          cmake -B ${{ env.BUILD_DIR }}/${{ matrix.target }} \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DTARGET_BOARD=${{ matrix.target }} \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/arm-none-eabi.cmake \
+            -DENABLE_COVERAGE=${{ matrix.build_type == 'Debug' && 'ON' || 'OFF' }} \
+            -DENABLE_UNIT_TESTS=ON \
+            -DPROJECT_VERSION=${{ needs.setup.outputs.build_version }} \
+            -GNinja
+
+      - name: Compile Firmware
+        run: |
+          cmake --build ${{ env.BUILD_DIR }}/${{ matrix.target }} \
+            --parallel $(nproc) \
+            --target all 2>&1 | tee build_${{ matrix.target }}.log
+          
+          # Capture build warnings count
+          WARNINGS=$(grep -c "warning:" build_${{ matrix.target }}.log || true)
+          echo "### ⚠️ Build Warnings (${{ matrix.target }}): $WARNINGS" >> $GITHUB_STEP_SUMMARY
+
+      - name: Generate Build Artifacts (Binary, Map, ELF)
+        run: |
+          mkdir -p ${{ env.ARTIFACTS_DIR }}/${{ matrix.target }}
+          arm-none-eabi-size ${{ env.BUILD_DIR }}/${{ matrix.target }}/${{ env.PROJECT_NAME }}.elf \
+            | tee ${{ env.ARTIFACTS_DIR }}/${{ matrix.target }}/memory_usage.txt
+          
+          # Memory usage summary to markdown
+          echo "#### 📦 Memory Map — ${{ matrix.target }}" >> $GITHUB_STEP_SUMMARY
+          cat ${{ env.ARTIFACTS_DIR }}/${{ matrix.target }}/memory_usage.txt >> $GITHUB_STEP_SUMMARY
+
+          cp ${{ env.BUILD_DIR }}/${{ matrix.target }}/${{ env.PROJECT_NAME }}.elf  ${{ env.ARTIFACTS_DIR }}/${{ matrix.target }}/
+          cp ${{ env.BUILD_DIR }}/${{ matrix.target }}/${{ env.PROJECT_NAME }}.bin  ${{ env.ARTIFACTS_DIR }}/${{ matrix.target }}/
+          cp ${{ env.BUILD_DIR }}/${{ matrix.target }}/${{ env.PROJECT_NAME }}.map  ${{ env.ARTIFACTS_DIR }}/${{ matrix.target }}/
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fw-binaries-${{ matrix.target }}-${{ matrix.build_type }}
+          path: ${{ env.ARTIFACTS_DIR }}/${{ matrix.target }}/
+          retention-days: 30
+
+  # ──────────────────────────────────────────
+  # JOB 3 ▸ KLOCWORK STATIC ANALYSIS (SAST)
+  # ──────────────────────────────────────────
+  klocwork_analysis:
+    name: "🔍 Klocwork Static Analysis"
+    runs-on: [self-hosted, klocwork-agent]
+    needs: [setup, build]
+    env:
+      KW_BUILD_SPEC: kw_buildspec.xml
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Klocwork — Build Capture (Intercept Build)
+        run: |
+          mkdir -p ${{ env.REPORTS_DIR }}/klocwork
+          
+          # Run kwinject to intercept the build and generate a build spec
+          kwinject --output ${{ env.KW_BUILD_SPEC }} \
+            cmake --build ${{ env.BUILD_DIR }}/stm32f4 --parallel $(nproc)
+
+      - name: Klocwork — Perform Full Analysis
+        run: |
+          # Create/update Klocwork project tables
+          kwbuildproject \
+            --tables-directory kw_tables \
+            --force \
+            ${{ env.KW_BUILD_SPEC }}
+          
+          # Load results to Klocwork CI server
+          kwadmin --url ${{ env.KLOCWORK_URL }} \
+            load ${{ env.KLOCWORK_PROJECT }} kw_tables
+
+      - name: Klocwork — Differential Analysis (PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          # Check only new/modified code on PRs for fast feedback
+          kwciagent check \
+            --url ${{ env.KLOCWORK_URL }} \
+            --user ci-bot \
+            --ltoken ${{ env.KLOCWORK_TOKEN }} \
+            --project ${{ env.KLOCWORK_PROJECT }} \
+            --build-id "PR-${{ github.event.pull_request.number }}" \
+            --report ${{ env.REPORTS_DIR }}/klocwork/kw_diff_report.xml
+
+      - name: Klocwork — Full Project Report (main/release only)
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release')
+        run: |
+          kwcheck list \
+            --url ${{ env.KLOCWORK_URL }} \
+            --project ${{ env.KLOCWORK_PROJECT }} \
+            --format xml \
+            > ${{ env.REPORTS_DIR }}/klocwork/kw_full_report.xml
+          
+          kwcheck list \
+            --url ${{ env.KLOCWORK_URL }} \
+            --project ${{ env.KLOCWORK_PROJECT }} \
+            --format csv \
+            > ${{ env.REPORTS_DIR }}/klocwork/kw_full_report.csv
+
+      - name: Klocwork — MISRA C:2012 Compliance Check
+        run: |
+          kwcheck list \
+            --url ${{ env.KLOCWORK_URL }} \
+            --project ${{ env.KLOCWORK_PROJECT }} \
+            --severity Critical,Error \
+            --taxonomy ${{ env.MISRA_RULESET }} \
+            --format xml \
+            > ${{ env.REPORTS_DIR }}/klocwork/kw_misra_report.xml
+          
+          # Fail pipeline on Critical issues
+          CRITICAL=$(grep -c 'severity="Critical"' ${{ env.REPORTS_DIR }}/klocwork/kw_misra_report.xml || true)
+          echo "### 🛡 MISRA Critical Issues: $CRITICAL" >> $GITHUB_STEP_SUMMARY
+          if [ "$CRITICAL" -gt "0" ]; then
+            echo "❌ CRITICAL MISRA violations found! Blocking pipeline."
+            exit 1
+          fi
+
+      - name: Klocwork — Enforce Issue Gate
+        run: |
+          python3 scripts/kw_gate_check.py \
+            --report ${{ env.REPORTS_DIR }}/klocwork/kw_full_report.xml \
+            --max-critical 0 \
+            --max-error 5 \
+            --max-warning 50 \
+            --output ${{ env.REPORTS_DIR }}/klocwork/kw_gate_result.json
+
+      - name: Upload Klocwork Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: klocwork-reports
+          path: ${{ env.REPORTS_DIR }}/klocwork/
+          retention-days: 60
+
+  # ──────────────────────────────────────────
+  # JOB 4 ▸ CPPCHECK + MISRA (Supplemental)
+  # ──────────────────────────────────────────
+  cppcheck_misra:
+    name: "📐 CppCheck + MISRA Analysis"
+    runs-on: [self-hosted, embedded-build-agent]
+    needs: setup
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run CppCheck with MISRA C:2012
+        run: |
+          mkdir -p ${{ env.REPORTS_DIR }}/cppcheck
+          
+          cppcheck \
+            --enable=all \
+            --std=c99 \
+            --force \
+            --inline-suppr \
+            --addon=misra.py \
+            --suppressions-list=.cppcheck-suppressions \
+            --xml --xml-version=2 \
+            --output-file=${{ env.REPORTS_DIR }}/cppcheck/cppcheck_results.xml \
+            src/ include/ 2>&1 | tee ${{ env.REPORTS_DIR }}/cppcheck/cppcheck_raw.log
+
+      - name: Convert CppCheck XML to JUnit
+        run: |
+          cppcheck-junit \
+            ${{ env.REPORTS_DIR }}/cppcheck/cppcheck_results.xml \
+            ${{ env.REPORTS_DIR }}/cppcheck/cppcheck_junit.xml
+
+      - name: Publish CppCheck Results
+        uses: mikepenz/action-junit-report@v4
+        if: always()
+        with:
+          report_paths: ${{ env.REPORTS_DIR }}/cppcheck/cppcheck_junit.xml
+          check_name: "CppCheck MISRA Analysis"
+
+      - name: Upload CppCheck Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cppcheck-reports
+          path: ${{ env.REPORTS_DIR }}/cppcheck/
+          retention-days: 30
+
+  # ──────────────────────────────────────────
+  # JOB 5 ▸ UNIT TESTING (Host-side)
+  # ──────────────────────────────────────────
+  unit_tests:
+    name: "🧪 Unit Tests + Code Coverage"
+    runs-on: [self-hosted, embedded-build-agent]
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure Debug Build (Coverage Enabled)
+        run: |
+          cmake -B ${{ env.BUILD_DIR }}/unit_test \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DTARGET_BOARD=host \
+            -DENABLE_UNIT_TESTS=ON \
+            -DENABLE_COVERAGE=ON \
+            -DCOVERAGE_GCOV_TOOL=gcov \
+            -GNinja
+
+      - name: Build Unit Test Binaries
+        run: cmake --build ${{ env.BUILD_DIR }}/unit_test --parallel $(nproc)
+
+      - name: Execute Unit Tests via CTest
+        run: |
+          mkdir -p ${{ env.REPORTS_DIR }}/unit_tests
+          
+          cd ${{ env.BUILD_DIR }}/unit_test
+          ctest \
+            --output-on-failure \
+            --parallel $(nproc) \
+            --output-junit ../../${{ env.REPORTS_DIR }}/unit_tests/ctest_results.xml \
+            --timeout 120 \
+            -T Test 2>&1 | tee ../../${{ env.REPORTS_DIR }}/unit_tests/ctest_output.log
+
+      - name: Generate LCOV Coverage Data
+        run: |
+          lcov \
+            --capture \
+            --directory ${{ env.BUILD_DIR }}/unit_test \
+            --output-file ${{ env.REPORTS_DIR }}/unit_tests/coverage.info \
+            --gcov-tool gcov \
+            --rc lcov_branch_coverage=1
+
+          # Remove system files and test code from coverage
+          lcov \
+            --remove ${{ env.REPORTS_DIR }}/unit_tests/coverage.info \
+            '/usr/*' '*/test/*' '*/unity/*' '*/mock/*' \
+            --output-file ${{ env.REPORTS_DIR }}/unit_tests/coverage_filtered.info \
+            --rc lcov_branch_coverage=1
+
+      - name: Generate HTML Coverage Report
+        run: |
+          genhtml \
+            ${{ env.REPORTS_DIR }}/unit_tests/coverage_filtered.info \
+            --output-directory ${{ env.REPORTS_DIR }}/unit_tests/coverage_html \
+            --branch-coverage \
+            --function-coverage \
+            --title "${{ env.PROJECT_NAME }} Coverage — ${{ needs.setup.outputs.build_version }}"
+
+      - name: Generate Cobertura XML (for CI integration)
+        run: |
+          gcovr \
+            --root . \
+            --filter src/ \
+            --xml-pretty \
+            --output ${{ env.REPORTS_DIR }}/unit_tests/coverage_cobertura.xml \
+            --html-details ${{ env.REPORTS_DIR }}/unit_tests/gcovr_html/index.html \
+            --branch \
+            --sort-percentage
+
+      - name: Enforce Coverage Threshold
+        run: |
+          COVERAGE=$(gcovr --root . --filter src/ --print-summary 2>/dev/null \
+            | grep "^TOTAL" | awk '{print $NF}' | tr -d '%')
+          echo "### 📊 Code Coverage: ${COVERAGE}%" >> $GITHUB_STEP_SUMMARY
+          if (( $(echo "$COVERAGE < ${{ env.COVERAGE_THRESHOLD }}" | bc -l) )); then
+            echo "❌ Coverage $COVERAGE% is below threshold ${{ env.COVERAGE_THRESHOLD }}%"
+            exit 1
+          fi
+
+      - name: Publish Unit Test Results
+        uses: mikepenz/action-junit-report@v4
+        if: always()
+        with:
+          report_paths: ${{ env.REPORTS_DIR }}/unit_tests/ctest_results.xml
+          check_name: "Unit Tests"
+          fail_on_failure: true
+
+      - name: Upload Coverage Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-reports
+          path: ${{ env.REPORTS_DIR }}/unit_tests/
+          retention-days: 30
+
+  # ──────────────────────────────────────────
+  # JOB 6 ▸ REGRESSION TESTING
+  # ──────────────────────────────────────────
+  regression_tests:
+    name: "🔄 Regression Testing"
+    runs-on: [self-hosted, hw-test-rack]
+    needs: [unit_tests, klocwork_analysis]
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        test_suite:
+          - name: "HAL Layer"
+            path: tests/regression/hal
+            timeout: 30
+          - name: "Communication Stack (CAN/LIN/SPI)"
+            path: tests/regression/comm_stack
+            timeout: 45
+          - name: "Safety Functions (ISO26262)"
+            path: tests/regression/safety
+            timeout: 60
+          - name: "Power Management"
+            path: tests/regression/power
+            timeout: 20
+          - name: "Bootloader"
+            path: tests/regression/bootloader
+            timeout: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Firmware Binary
+        uses: actions/download-artifact@v4
+        with:
+          name: fw-binaries-stm32f4-Release
+          path: ${{ env.ARTIFACTS_DIR }}/stm32f4/
+
+      - name: Flash Target Hardware
+        run: |
+          # Flash via OpenOCD / J-Link
+          openocd \
+            -f interface/jlink.cfg \
+            -f target/${{ github.event.inputs.target_board || 'stm32f4' }}.cfg \
+            -c "program ${{ env.ARTIFACTS_DIR }}/stm32f4/${{ env.PROJECT_NAME }}.elf verify reset exit" \
+            2>&1 | tee flash_${{ matrix.test_suite.name }}.log
+
+      - name: Execute Regression Suite — ${{ matrix.test_suite.name }}
+        run: |
+          mkdir -p ${{ env.REPORTS_DIR }}/regression/${{ matrix.test_suite.name }}
+          
+          python3 scripts/run_regression.py \
+            --suite-path ${{ matrix.test_suite.path }} \
+            --target ${{ github.event.inputs.target_board || 'stm32f4' }} \
+            --timeout ${{ matrix.test_suite.timeout }} \
+            --output-xml ${{ env.REPORTS_DIR }}/regression/${{ matrix.test_suite.name }}/results.xml \
+            --output-csv ${{ env.REPORTS_DIR }}/regression/${{ matrix.test_suite.name }}/results.csv \
+            --log-level INFO
+
+      - name: Publish Regression Results — ${{ matrix.test_suite.name }}
+        uses: mikepenz/action-junit-report@v4
+        if: always()
+        with:
+          report_paths: ${{ env.REPORTS_DIR }}/regression/${{ matrix.test_suite.name }}/results.xml
+          check_name: "Regression — ${{ matrix.test_suite.name }}"
+
+      - name: Upload Regression Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: regression-${{ matrix.test_suite.name }}
+          path: ${{ env.REPORTS_DIR }}/regression/${{ matrix.test_suite.name }}/
+          retention-days: 45
+
+  # ──────────────────────────────────────────
+  # JOB 7 ▸ ENDURANCE TESTING
+  # ──────────────────────────────────────────
+  endurance_tests:
+    name: "⏱ Endurance & Stress Testing"
+    runs-on: [self-hosted, hw-endurance-rack]
+    needs: regression_tests
+    # Only run on main/release or manual trigger
+    if: |
+      github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/heads/release') ||
+      github.event.inputs.run_endurance == 'true'
+    timeout-minutes: 720  # 12 hours max
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Firmware Binary
+        uses: actions/download-artifact@v4
+        with:
+          name: fw-binaries-stm32f4-Release
+          path: ${{ env.ARTIFACTS_DIR }}/stm32f4/
+
+      - name: Flash Target for Endurance
+        run: |
+          openocd \
+            -f interface/jlink.cfg \
+            -f target/${{ github.event.inputs.target_board || 'stm32f4' }}.cfg \
+            -c "program ${{ env.ARTIFACTS_DIR }}/stm32f4/${{ env.PROJECT_NAME }}.elf verify reset exit"
+
+      - name: Soak Test — Continuous Operation (4hrs)
+        run: |
+          mkdir -p ${{ env.REPORTS_DIR }}/endurance/soak
+          python3 scripts/endurance/soak_test.py \
+            --duration 14400 \
+            --sample-interval 60 \
+            --metrics cpu_load,memory_usage,temperature,voltage \
+            --output ${{ env.REPORTS_DIR }}/endurance/soak/soak_results.csv \
+            --alerts-threshold temperature:85,voltage_drop:0.3
+
+      - name: Stress Test — Peak Load Cycles
+        run: |
+          mkdir -p ${{ env.REPORTS_DIR }}/endurance/stress
+          python3 scripts/endurance/stress_test.py \
+            --cycles 1000 \
+            --load-profile scripts/endurance/profiles/max_load.json \
+            --output ${{ env.REPORTS_DIR }}/endurance/stress/stress_results.csv
+
+      - name: Memory Leak Detection — Long Run
+        run: |
+          mkdir -p ${{ env.REPORTS_DIR }}/endurance/memory
+          python3 scripts/endurance/memory_monitor.py \
+            --duration 7200 \
+            --sample-interval 30 \
+            --leak-threshold 1024 \
+            --output ${{ env.REPORTS_DIR }}/endurance/memory/memory_results.csv \
+            --heap-dump ${{ env.REPORTS_DIR }}/endurance/memory/heap_dumps/
+
+      - name: Power Cycle Resilience Test
+        run: |
+          mkdir -p ${{ env.REPORTS_DIR }}/endurance/power_cycle
+          python3 scripts/endurance/power_cycle_test.py \
+            --cycles 500 \
+            --cycle-interval 5 \
+            --recovery-timeout 10 \
+            --output ${{ env.REPORTS_DIR }}/endurance/power_cycle/power_cycle_results.csv
+
+      - name: Watchdog Recovery Test
+        run: |
+          mkdir -p ${{ env.REPORTS_DIR }}/endurance/watchdog
+          python3 scripts/endurance/watchdog_test.py \
+            --scenarios scripts/endurance/scenarios/watchdog_triggers.json \
+            --output ${{ env.REPORTS_DIR }}/endurance/watchdog/watchdog_results.csv
+
+      - name: Upload Endurance Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: endurance-reports
+          path: ${{ env.REPORTS_DIR }}/endurance/
+          retention-days: 90
+
+  # ──────────────────────────────────────────
+  # JOB 8 ▸ SONARQUBE QUALITY GATE
+  # ──────────────────────────────────────────
+  sonarqube:
+    name: "📏 SonarQube Quality Gate"
+    runs-on: [self-hosted, embedded-build-agent]
+    needs: unit_tests
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Coverage Reports
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-reports
+          path: ${{ env.REPORTS_DIR }}/unit_tests/
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ env.SONARQUBE_TOKEN }}
+          SONAR_HOST_URL: ${{ env.SONARQUBE_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ env.PROJECT_NAME }}
+            -Dsonar.projectVersion=${{ needs.setup.outputs.build_version }}
+            -Dsonar.sources=src
+            -Dsonar.tests=tests
+            -Dsonar.cfamily.compile-commands=${{ env.BUILD_DIR }}/unit_test/compile_commands.json
+            -Dsonar.coverageReportPaths=${{ env.REPORTS_DIR }}/unit_tests/coverage_cobertura.xml
+            -Dsonar.c.misra.version=2012
+            -Dsonar.qualitygate.wait=true
+
+  # ──────────────────────────────────────────
+  # JOB 9 ▸ REPORT AGGREGATION
+  # ──────────────────────────────────────────
+  aggregate_reports:
+    name: "📋 Aggregate All Reports"
+    runs-on: [self-hosted, embedded-build-agent]
+    needs:
+      - klocwork_analysis
+      - cppcheck_misra
+      - unit_tests
+      - regression_tests
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_reports/
+
+      - name: Merge JUnit XML Reports
+        run: |
+          pip3 install junitparser --quiet
+          python3 scripts/reporting/merge_junit.py \
+            --input-dir all_reports/ \
+            --output ${{ env.REPORTS_DIR }}/aggregated/merged_junit.xml \
+            --suite-name "${{ env.PROJECT_NAME }}-v${{ needs.setup.outputs.build_version }}"
+
+      - name: Generate Comprehensive HTML Report
+        run: |
+          python3 scripts/reporting/generate_html_report.py \
+            --klocwork     all_reports/klocwork-reports/ \
+            --cppcheck     all_reports/cppcheck-reports/ \
+            --coverage     all_reports/coverage-reports/ \
+            --regression   all_reports/regression-*/ \
+            --version      ${{ needs.setup.outputs.build_version }} \
+            --commit       ${{ needs.setup.outputs.commit_sha }} \
+            --branch       ${{ needs.setup.outputs.branch_name }} \
+            --output       ${{ env.REPORTS_DIR }}/aggregated/full_report.html
+
+      - name: Generate Executive Summary (PDF)
+        run: |
+          python3 scripts/reporting/generate_pdf_summary.py \
+            --input  ${{ env.REPORTS_DIR }}/aggregated/full_report.html \
+            --output ${{ env.REPORTS_DIR }}/aggregated/executive_summary.pdf \
+            --title  "${{ env.PROJECT_NAME }} SDLC Report" \
+            --version ${{ needs.setup.outputs.build_version }}
+
+      - name: Upload Aggregated Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdlc-full-report-${{ needs.setup.outputs.build_version }}
+          path: ${{ env.REPORTS_DIR }}/aggregated/
+          retention-days: 90
+
+  # ──────────────────────────────────────────
+  # JOB 10 ▸ DATA VISUALIZATION DASHBOARD
+  # ──────────────────────────────────────────
+  data_visualization:
+    name: "📊 Data Visualization & Dashboards"
+    runs-on: [self-hosted, embedded-build-agent]
+    needs: aggregate_reports
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download All Reports
+        uses: actions/download-artifact@v4
+        with:
+          path: all_reports/
+
+      - name: Install Visualization Stack
+        run: |
+          pip3 install --quiet \
+            plotly pandas numpy matplotlib seaborn \
+            kaleido jinja2 dash flask
+
+      - name: Generate Klocwork Trend Chart
+        run: |
+          python3 scripts/viz/kw_trend.py \
+            --history-db kw_history.sqlite \
+            --current    all_reports/klocwork-reports/kw_full_report.csv \
+            --output     ${{ env.REPORTS_DIR }}/viz/kw_trend.html \
+            --format     html,png
+
+      - name: Generate Test Results Heatmap
+        run: |
+          python3 scripts/viz/test_heatmap.py \
+            --regression all_reports/regression-*/*.csv \
+            --output     ${{ env.REPORTS_DIR }}/viz/test_heatmap.html
+
+      - name: Generate Coverage Treemap
+        run: |
+          python3 scripts/viz/coverage_treemap.py \
+            --gcovr-json all_reports/coverage-reports/coverage_cobertura.xml \
+            --output     ${{ env.REPORTS_DIR }}/viz/coverage_treemap.html
+
+      - name: Generate Memory Usage Timeline
+        run: |
+          python3 scripts/viz/memory_timeline.py \
+            --builds-dir all_reports/ \
+            --output     ${{ env.REPORTS_DIR }}/viz/memory_timeline.html
+
+      - name: Generate Endurance Metrics Dashboard
+        if: needs.endurance_tests.result == 'success' || needs.endurance_tests.result == 'skipped'
+        run: |
+          python3 scripts/viz/endurance_dashboard.py \
+            --soak-csv   all_reports/endurance-reports/soak/soak_results.csv \
+            --stress-csv all_reports/endurance-reports/stress/stress_results.csv \
+            --mem-csv    all_reports/endurance-reports/memory/memory_results.csv \
+            --output     ${{ env.REPORTS_DIR }}/viz/endurance_dashboard.html
+
+      - name: Build Combined Plotly Dashboard
+        run: |
+          python3 scripts/viz/combined_dashboard.py \
+            --viz-dir    ${{ env.REPORTS_DIR }}/viz/ \
+            --version    ${{ needs.setup.outputs.build_version }} \
+            --output     ${{ env.REPORTS_DIR }}/viz/sdlc_dashboard.html
+
+      - name: Publish Dashboard to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        if: github.ref == 'refs/heads/main'
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ${{ env.REPORTS_DIR }}/viz/
+          destination_dir: dashboards/${{ needs.setup.outputs.build_version }}
+
+      - name: Upload Visualization Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdlc-dashboards-${{ needs.setup.outputs.build_version }}
+          path: ${{ env.REPORTS_DIR }}/viz/
+          retention-days: 60
+
+  # ──────────────────────────────────────────
+  # JOB 11 ▸ RELEASE PACKAGING
+  # ──────────────────────────────────────────
+  release:
+    name: "🚀 Release Packaging & Tagging"
+    runs-on: [self-hosted, embedded-build-agent]
+    needs:
+      - klocwork_analysis
+      - regression_tests
+      - sonarqube
+      - data_visualization
+    if: startsWith(github.ref, 'refs/heads/release') || github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download All Binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fw-binaries-*-Release
+          path: release_binaries/
+
+      - name: Download Full Report
+        uses: actions/download-artifact@v4
+        with:
+          name: sdlc-full-report-${{ needs.setup.outputs.build_version }}
+          path: release_reports/
+
+      - name: Create Release Package
+        run: |
+          VERSION=${{ needs.setup.outputs.build_version }}
+          mkdir -p release_package
+          
+          # Package binaries
+          for dir in release_binaries/*/; do
+            TARGET=$(basename "$dir")
+            cp -r "$dir" "release_package/${TARGET}/"
+          done
+          
+          # Include reports & changelog
+          cp -r release_reports/ release_package/reports/
+          cp CHANGELOG.md release_package/
+          
+          # Create signed manifest
+          find release_package -type f -exec sha256sum {} \; > release_package/SHA256SUMS.txt
+          gpg --batch --yes --passphrase "${{ secrets.GPG_PASSPHRASE }}" \
+            --sign release_package/SHA256SUMS.txt
+          
+          tar -czf ${PROJECT_NAME}-${VERSION}-release.tar.gz release_package/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.setup.outputs.build_version }}
+          name: "${{ env.PROJECT_NAME }} v${{ needs.setup.outputs.build_version }}"
+          body_path: CHANGELOG.md
+          files: |
+            ${{ env.PROJECT_NAME }}-${{ needs.setup.outputs.build_version }}-release.tar.gz
+            release_package/SHA256SUMS.txt
+          draft: false
+          prerelease: ${{ contains(needs.setup.outputs.build_version, '-dev') }}
+
+  # ──────────────────────────────────────────
+  # JOB 12 ▸ NOTIFICATIONS
+  # ──────────────────────────────────────────
+  notify:
+    name: "🔔 Notify Teams"
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - klocwork_analysis
+      - unit_tests
+      - regression_tests
+      - data_visualization
+    if: always()
+    steps:
+      - name: Compute Overall Pipeline Status
+        id: status
+        run: |
+          if [[ "${{ needs.build.result }}" == "success" &&
+                "${{ needs.klocwork_analysis.result }}" == "success" &&
+                "${{ needs.unit_tests.result }}" == "success" &&
+                "${{ needs.regression_tests.result }}" == "success" ]]; then
+            echo "status=✅ PASSED" >> $GITHUB_OUTPUT
+            echo "color=good"       >> $GITHUB_OUTPUT
+          else
+            echo "status=❌ FAILED" >> $GITHUB_OUTPUT
+            echo "color=danger"     >> $GITHUB_OUTPUT
+          fi
+
+      - name: Notify Slack — Engineering Channel
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          payload: |
+            {
+              "attachments": [{
+                "color": "${{ steps.status.outputs.color }}",
+                "title": "Embedded SDLC Pipeline — ${{ steps.status.outputs.status }}",
+                "fields": [
+                  { "title": "Project",    "value": "${{ env.PROJECT_NAME }}", "short": true },
+                  { "title": "Version",    "value": "${{ needs.setup.outputs.build_version }}", "short": true },
+                  { "title": "Branch",     "value": "${{ needs.setup.outputs.branch_name }}", "short": true },
+                  { "title": "Commit",     "value": "${{ needs.setup.outputs.commit_sha }}", "short": true },
+                  { "title": "Build",      "value": "${{ needs.build.result }}", "short": true },
+                  { "title": "Klocwork",   "value": "${{ needs.klocwork_analysis.result }}", "short": true },
+                  { "title": "Unit Tests", "value": "${{ needs.unit_tests.result }}", "short": true },
+                  { "title": "Regression", "value": "${{ needs.regression_tests.result }}", "short": true }
+                ],
+                "footer": "GitHub Actions",
+                "ts": "${{ github.event.head_commit.timestamp }}"
+              }]
+            }
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Notify Teams — on Failure Only
+        if: steps.status.outputs.status == '❌ FAILED'
+        uses: aliencube/microsoft-teams-actions@v0.8.0
+        with:
+          webhook_uri: ${{ secrets.TEAMS_WEBHOOK_URI }}
+          title: "🚨 Pipeline Failed — ${{ env.PROJECT_NAME }}"
+          summary: "SDLC pipeline failure on branch ${{ needs.setup.outputs.branch_name }}"
+          text: |
+            **Build:** ${{ needs.build.result }}
+            **Klocwork:** ${{ needs.klocwork_analysis.result }}
+            **Unit Tests:** ${{ needs.unit_tests.result }}
+            **Regression:** ${{ needs.regression_tests.result }}
