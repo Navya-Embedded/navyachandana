@@ -1,108 +1,142 @@
 import requests
-from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
 import json
-from datetime import datetime
+import os
 
-KEYWORDS = [
-    "embedded",
-    "firmware",
-    "embedded software",
-    "rtos",
-    "device software"
-]
+SEEN_FILE = "jobs_seen.json"
+POST_FILE = "daily_post.txt"
 
-QUERIES = [
-    "embedded systems intern",
-    "firmware intern",
+SEARCH_QUERIES = [
     "embedded software intern",
-    "rtos intern"
+    "firmware intern",
+    "embedded systems intern",
+    "hardware intern",
+    "computer engineering intern"
 ]
 
-def load_seen_jobs():
-    try:
-        with open("jobs_seen.json", "r") as f:
-            return json.load(f)
-    except:
-        return []
 
-def save_seen_jobs(jobs):
-    with open("jobs_seen.json", "w") as f:
-        json.dump(jobs, f)
+# ------------------------
+# LOAD SEEN JOBS
+# ------------------------
 
-def fetch_jobs():
+def load_seen():
+    if os.path.exists(SEEN_FILE):
+        with open(SEEN_FILE, "r") as f:
+            return set(json.load(f))
+    return set()
+
+
+def save_seen(seen):
+    with open(SEEN_FILE, "w") as f:
+        json.dump(list(seen), f)
+
+
+# ------------------------
+# FETCH INDEED JOBS
+# ------------------------
+
+def fetch_indeed():
 
     jobs = []
 
-    for query in QUERIES:
+    for query in SEARCH_QUERIES:
 
-        url = f"https://www.indeed.com/jobs?q={query}"
+        q = query.replace(" ", "+")
 
-        page = requests.get(url)
+        url = f"https://www.indeed.com/jobs?q=embedded&l=United+States"
 
-        soup = BeautifulSoup(page.text, "html.parser")
+        try:
+            response = requests.get(url, timeout=10)
 
-        for job in soup.select(".job_seen_beacon"):
+            if response.status_code != 200:
+                continue
 
-            title = job.select_one("h2").text.strip()
-            company = job.select_one(".companyName").text.strip()
-            location = job.select_one(".companyLocation").text.strip()
+            root = ET.fromstring(response.content)
 
-            link = "https://www.indeed.com" + job.select_one("a")["href"]
+            for item in root.findall(".//item"):
 
-            if any(k in title.lower() for k in KEYWORDS):
+                title = item.find("title").text
+                link = item.find("link").text
 
                 jobs.append({
+                    "id": link,
                     "title": title,
-                    "company": company,
-                    "location": location,
                     "link": link
                 })
+
+        except:
+            continue
 
     return jobs
 
 
-def remove_duplicates(jobs, seen):
+# ------------------------
+# FILTER DUPLICATES
+# ------------------------
 
-    new_jobs = []
+def filter_jobs(jobs, seen):
+
+    filtered = []
 
     for job in jobs:
 
-        key = job["title"] + job["company"]
+        if job["id"] not in seen:
 
-        if key not in seen:
-            new_jobs.append(job)
-            seen.append(key)
+            filtered.append(job)
+            seen.add(job["id"])
 
-    return new_jobs, seen
+    return filtered
 
 
-def create_post(jobs):
+# ------------------------
+# GENERATE POST
+# ------------------------
 
-    post = "🚀 Embedded Systems & Firmware Internship Updates (USA)\n\n"
+def generate_post(jobs):
 
-    for i, job in enumerate(jobs[:10]):
+    header = "🚀 Embedded Systems & Firmware Internship Updates (USA)\n\n"
 
-        post += f"{i+1}. {job['company']} – {job['title']}\n"
-        post += f"📍 Location: {job['location']}\n"
+    footer = "\nKnow other embedded internships? Share them below.\n\n#EmbeddedSystems #Firmware #EmbeddedJobs #Internships"
+
+    if not jobs:
+        return header + "Few results found today. Try searching manually on LinkedIn.\n\n" + footer
+
+    post = header
+
+    for i, job in enumerate(jobs[:10], 1):
+
+        post += f"{i}. {job['title']}\n"
         post += f"🔗 Apply: {job['link']}\n\n"
 
-    post += "Know other embedded internships? Share them below.\n\n"
-    post += "#EmbeddedSystems #Firmware #EmbeddedJobs #Internships"
+    post += footer
 
     return post
 
 
-seen = load_seen_jobs()
+# ------------------------
+# MAIN
+# ------------------------
 
-jobs = fetch_jobs()
+def main():
 
-jobs, seen = remove_duplicates(jobs, seen)
+    print("Running Internship Finder Bot...")
 
-save_seen_jobs(seen)
+    seen = load_seen()
 
-post = create_post(jobs)
+    jobs = fetch_indeed()
 
-with open("daily_post.txt", "w") as f:
-    f.write(post)
+    filtered = filter_jobs(jobs, seen)
 
-print(post)
+    post = generate_post(filtered)
+
+    with open(POST_FILE, "w", encoding="utf-8") as f:
+        f.write(post)
+
+    save_seen(seen)
+
+    print("\nGenerated Post:\n")
+    print(post)
+
+
+if __name__ == "__main__":
+    main()
