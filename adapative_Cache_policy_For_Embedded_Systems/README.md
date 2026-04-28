@@ -1,6 +1,6 @@
 # Adaptive LRU/FIFO Cache Replacement Policy
 
-**ECEN 614 - Computer Architecture | Texas A&M University | Group 19**
+**ECEN 614 - Computer Architecture | Texas A&M University **
 
 > A lightweight adaptive cache replacement policy that dynamically switches between LRU and FIFO at runtime using a set-dueling mechanism. Implemented as a gem5 replacement policy extension and evaluated across 432 simulation configurations.
 
