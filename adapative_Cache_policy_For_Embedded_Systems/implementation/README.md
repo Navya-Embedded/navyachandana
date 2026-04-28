@@ -1,5 +1,5 @@
 # Adaptive LRU/FIFO Cache Replacement — gem5 Implementation
-## Group 19 | Texas A&M University | ECEN 676
+## Texas A&M University
 
 ### Files
 - gem5_files/adaptive_lrufifo_rp.hh   — C++ header (copy to src/mem/cache/replacement_policies/)
